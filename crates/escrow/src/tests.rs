@@ -167,6 +167,75 @@ fn escrow_error_surface_keeps_validation_and_token_failures_distinct() {
 }
 
 #[test]
+fn eligibility_pending_offers_deposit_and_cancel_to_the_buyer_only() {
+    let (_env, _token, _tc, _id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let id = create(&client, &_token, buyer, seller, arbiter, TIMEOUT);
+
+    let as_buyer = client.eligibility(&id, buyer);
+    assert_eq!(as_buyer.status, EscrowStatus::Pending);
+    assert!(as_buyer.deposit, "buyer deposits a pending escrow");
+    assert!(as_buyer.cancel, "buyer may cancel before funding");
+    assert!(!as_buyer.release, "nothing to release before funding");
+    assert!(!as_buyer.dispute, "no dispute before funding");
+    assert!(!as_buyer.resolve, "arbiter resolves only a disputed escrow");
+
+    let as_arbiter = client.eligibility(&id, arbiter);
+    assert!(!as_arbiter.deposit);
+    assert!(!as_arbiter.cancel, "only the buyer cancels");
+    assert!(!as_arbiter.resolve, "nothing to resolve while pending");
+}
+
+#[test]
+fn eligibility_funded_matches_the_release_and_dispute_guards() {
+    let (_env, _token, _tc, _id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let id = create(&client, &_token, buyer, seller, arbiter, TIMEOUT);
+    client.deposit(&id);
+
+    let as_seller = client.eligibility(&id, seller);
+    assert_eq!(as_seller.status, EscrowStatus::Funded);
+    assert!(as_seller.release, "seller releases a funded escrow");
+    assert!(!as_seller.deposit, "deposit is spent");
+    assert!(as_seller.dispute, "either party may dispute once funded");
+    assert!(!as_seller.cancel, "a funded escrow cannot be cancelled");
+
+    let as_arbiter = client.eligibility(&id, arbiter);
+    assert!(!as_arbiter.resolve, "arbiter acts only after a dispute");
+    assert!(!as_arbiter.release, "arbiter never releases");
+}
+
+#[test]
+fn eligibility_disputed_and_elapsed_refund_flip_as_the_contract_does() {
+    let (env, _token, _tc, _id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let id = create(&client, &_token, buyer, seller, arbiter, TIMEOUT);
+    client.deposit(&id);
+
+    // Before the deadline `refund_authorizer` names the seller; after it, the buyer.
+    assert!(client.eligibility(&id, seller).refund);
+    assert!(!client.eligibility(&id, buyer).refund);
+
+    env.ledger().set_timestamp(START + TIMEOUT + 1);
+    assert!(client.eligibility(&id, buyer).refund);
+    assert!(!client.eligibility(&id, seller).refund);
+
+    client.dispute(&id, buyer);
+    let as_arbiter = client.eligibility(&id, arbiter);
+    assert_eq!(as_arbiter.status, EscrowStatus::Disputed);
+    assert!(as_arbiter.resolve, "arbiter resolves once disputed");
+    assert!(!as_arbiter.release, "dispute freezes release");
+    assert!(client.eligibility(&id, buyer).dispute == false, "already disputed");
+}
+
+#[test]
+fn eligibility_rejects_an_unknown_escrow() {
+    let (_env, _token, _tc, _id, client, accounts) = setup!();
+    let err = client.try_eligibility(&999_u64, &accounts.user1).unwrap_err();
+    assert_eq!(err, Ok(ForgeError::NotFound));
+}
+
+#[test]
 fn create_escrow_records_parties_and_stays_pending() {
     let (_env, _token, _tc, _id, client, accounts) = setup!();
     let (buyer, seller, arbiter) = parties(&accounts);

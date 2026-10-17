@@ -392,6 +392,19 @@ pub trait SorobanForgeEscrow {
     /// * [`ForgeError::InvalidInput`] — escrow is not `Pending`.
     fn cancel(env: Env, escrow_id: u64) -> Result<(), ForgeError>;
 
+    /// Read-only summary of which actions `user` may perform on this escrow
+    /// right now, derived from the same conditions the actions themselves check
+    /// (state, role, refund deadline). Nothing here authorizes: each action
+    /// still calls `require_auth` when it runs.
+    ///
+    /// Single-token escrows only; basket escrows report [`ForgeError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::NotFound`] — no escrow with this id.
+    fn eligibility(env: Env, escrow_id: u64, user: Address) -> Result<ActionEligibility, ForgeError>;
+
+
     // -------------------------------------------------------------------
     // Multi-asset baskets
     //
@@ -638,6 +651,28 @@ pub enum EscrowStatus {
 /// do not contain a `released` field. They are loaded via a backward-compat
 /// decode path that defaults `released` to `0` (see `load_escrow` internals
 /// and the module-level storage compatibility note).
+/// What `eligibility` reports: one flag per mutating action, plus the state
+/// they were derived from so a caller can explain a `false` without a second
+/// read. Every flag mirrors the guard of the matching entry point.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActionEligibility {
+    /// `deposit` — buyer, while the escrow is Pending.
+    pub deposit: bool,
+    /// `release` — seller, once Funded.
+    pub release: bool,
+    /// `refund` — whichever side `refund_authorizer` names for the current time.
+    pub refund: bool,
+    /// `dispute` — buyer or seller, once Funded.
+    pub dispute: bool,
+    /// `resolve` / `resolve_split` — arbiter, while Disputed.
+    pub resolve: bool,
+    /// `cancel` — buyer, while Pending (never funded).
+    pub cancel: bool,
+    /// State the flags were computed from.
+    pub status: EscrowStatus,
+}
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct EscrowData {
@@ -1228,6 +1263,46 @@ impl Escrow {
     // -------------------------------------------------------------------
     // Multi-asset baskets
     // -------------------------------------------------------------------
+
+    /// Read-only summary of which actions `user` may currently perform on this
+    /// escrow, derived from the SAME conditions the actions themselves enforce
+    /// (`status`, role, and the refund deadline). Nothing here authorizes: the
+    /// actions still call `require_auth` when they run, so a stale summary can
+    /// never let an unauthorized caller through.
+    ///
+    /// Covers single-token escrows. Basket escrows are driven by their own
+    /// entry points and report `NotFound` here.
+    ///
+    /// * [`ForgeError::NotFound`] — no escrow with this id
+    pub fn eligibility(env: Env, escrow_id: u64, user: Address) -> Result<ActionEligibility, ForgeError> {
+        let escrow = Self::load_escrow(&env, escrow_id)?;
+        let is_buyer = user == escrow.buyer;
+        let is_seller = user == escrow.seller;
+        let is_arbiter = user == escrow.arbiter;
+        let funded = escrow.status == EscrowStatus::Funded;
+        let pending = escrow.status == EscrowStatus::Pending;
+        let disputed = escrow.status == EscrowStatus::Disputed;
+
+        // Mirror `refund`: the authorizer flips from seller to buyer once the
+        // timeout has elapsed, so the same helper decides eligibility here.
+        let refund_authorizer = refund_authorizer(
+            &env,
+            escrow.created_at,
+            escrow.timeout,
+            &escrow.buyer,
+            &escrow.seller,
+        )?;
+
+        Ok(ActionEligibility {
+            deposit: pending && is_buyer,
+            release: funded && is_seller,
+            refund: funded && user == refund_authorizer,
+            dispute: funded && (is_buyer || is_seller),
+            resolve: disputed && is_arbiter,
+            cancel: pending && is_buyer,
+            status: escrow.status,
+        })
+    }
 
     /// Create a basket escrow. Buyer-authorized only, exactly as
     /// [`Self::create_escrow`], and drawing from the same id sequence.
