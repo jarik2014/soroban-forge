@@ -277,6 +277,18 @@ pub trait SorobanForgeDaoGovernance {
         proposal_id: u64,
     ) -> Result<Proposal, soroban_forge_shared_utils::ForgeError>;
 
+    /// Read-only readiness view for a proposal: state, voting window, tallies,
+    /// and whether `execute` would succeed now, be retried later, or is blocked
+    /// for good. Never mutates state.
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::NotFound`] — no proposal with this id.
+    fn readiness(
+        env: Env,
+        proposal_id: u64,
+    ) -> Result<ProposalReadiness, soroban_forge_shared_utils::ForgeError>;
+
     /// Return the total number of proposals created (read-only view).
     fn get_proposal_count(env: Env) -> u64;
 
@@ -353,6 +365,48 @@ pub struct BondConfig {
     /// Receives bonds forfeited by defeated proposals. Never receives
     /// refunds and holds no other authority.
     pub treasury: Address,
+}
+
+/// Read-only answer to "can this proposal move, and if not, why not?".
+///
+/// Every flag is derived from the same conditions `execute` applies, so a
+/// client never has to replay the window/majority rules itself:
+///
+/// * `voting_open` — the stored state is `Active` and the window has not closed.
+/// * `executable` — `execute` would succeed right now (window closed with a
+///   majority, or the proposal is already `Succeeded`).
+/// * `rejected` — the window closed without a majority; `execute` would mark it
+///   `Defeated` (this contract applies a simple `for > against` rule; there is
+///   no separate quorum threshold to report, so `majority_reached` is the
+///   closest honest equivalent).
+/// * `expired` — the window closed while the proposal was still `Active`.
+/// * `terminal` — no future call can make it executable: `Defeated`, `Executed`,
+///   `Cancelled`, or `Queued` (this contract's `execute` rejects `Queued`).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProposalReadiness {
+    /// Proposal this view describes.
+    pub proposal_id: u64,
+    /// Stored state at the time of the query.
+    pub state: ProposalState,
+    /// Ledger timestamp at which voting closes.
+    pub voting_ends: u64,
+    /// `true` while the proposal still accepts votes.
+    pub voting_open: bool,
+    /// `for` tally, in governance-token units.
+    pub for_votes: i128,
+    /// `against` tally, in governance-token units.
+    pub against_votes: i128,
+    /// `for_votes > against_votes` — the rule `execute` actually applies.
+    pub majority_reached: bool,
+    /// The voting window has passed and the proposal is still `Active`.
+    pub expired: bool,
+    /// `execute` would succeed right now.
+    pub executable: bool,
+    /// The window closed without a majority; `execute` would defeat it.
+    pub rejected: bool,
+    /// Nothing can make this proposal executable any more.
+    pub terminal: bool,
 }
 
 /// A single governance proposal.
@@ -881,6 +935,47 @@ impl DaoGovernance {
     }
 
     /// Read a stored proposal by id (read-only view).
+    /// Read-only readiness view — see [`ProposalReadiness`]. It reuses the same
+    /// window and majority rules as [`Self::execute`] instead of restating them
+    /// differently, and writes nothing.
+    pub fn readiness(env: Env, proposal_id: u64) -> Result<ProposalReadiness, ForgeError> {
+        let proposal = Self::get_proposal_impl(&env, proposal_id)?;
+        let now = env.ledger().timestamp();
+        let window_closed = now >= proposal.voting_ends;
+        let majority_reached = proposal.for_votes > proposal.against_votes;
+        let active = proposal.state == ProposalState::Active;
+
+        let voting_open = active && !window_closed;
+        let expired = active && window_closed;
+        let executable = match proposal.state {
+            ProposalState::Active => window_closed && majority_reached,
+            ProposalState::Succeeded => true,
+            _ => false,
+        };
+        let rejected = expired && !majority_reached;
+        let terminal = matches!(
+            proposal.state,
+            ProposalState::Defeated
+                | ProposalState::Executed
+                | ProposalState::Cancelled
+                | ProposalState::Queued
+        );
+
+        Ok(ProposalReadiness {
+            proposal_id,
+            state: proposal.state,
+            voting_ends: proposal.voting_ends,
+            voting_open,
+            for_votes: proposal.for_votes,
+            against_votes: proposal.against_votes,
+            majority_reached,
+            expired,
+            executable,
+            rejected,
+            terminal,
+        })
+    }
+
     pub fn get_proposal(env: Env, proposal_id: u64) -> Result<Proposal, ForgeError> {
         Self::get_proposal_impl(&env, proposal_id)
     }
@@ -1447,6 +1542,97 @@ mod tests {
             let caller = env.current_contract_address();
             caller.require_auth();
         }
+    }
+
+    /// Readiness: a fresh proposal is open, not executable, not terminal.
+    #[test]
+    fn readiness_reports_an_open_window() {
+        let (_env, client, _accounts, proposal_id, _target) = setup!();
+        let view = client.readiness(&proposal_id);
+
+        assert_eq!(view.proposal_id, proposal_id);
+        assert_eq!(view.state, ProposalState::Active);
+        assert_eq!(view.voting_ends, START + DURATION);
+        assert!(view.voting_open, "window is open at creation");
+        assert!(!view.expired);
+        assert!(!view.executable, "nothing executes while voting is open");
+        assert!(!view.rejected);
+        assert!(!view.terminal);
+        assert!(!view.majority_reached);
+        assert_eq!(view.for_votes, 0);
+        assert_eq!(view.against_votes, 0);
+    }
+
+    /// A majority while the window is open must not look executable.
+    #[test]
+    fn readiness_tracks_the_tally_but_waits_for_the_window() {
+        let (_env, client, accounts, proposal_id, _target) = setup!();
+        client.vote(&proposal_id, &accounts.user2, &true);
+
+        let view = client.readiness(&proposal_id);
+        assert!(view.voting_open);
+        assert!(view.majority_reached, "one for vote beats zero against");
+        assert!(!view.executable, "execute still reverts until the window closes");
+        assert!(!view.rejected);
+    }
+
+    /// Window closed with a majority: executable.
+    #[test]
+    fn readiness_after_the_window_with_a_majority_is_executable() {
+        let (env, client, accounts, proposal_id, _target) = setup!();
+        client.vote(&proposal_id, &accounts.user2, &true);
+        env.ledger().set_timestamp(START + DURATION + 1);
+
+        let view = client.readiness(&proposal_id);
+        assert!(!view.voting_open);
+        assert!(view.expired, "window closed while still Active");
+        assert!(view.majority_reached);
+        assert!(view.executable);
+        assert!(!view.rejected);
+        assert!(!view.terminal);
+    }
+
+    /// Window closed without a majority: execute would defeat it.
+    #[test]
+    fn readiness_after_the_window_without_a_majority_is_rejected() {
+        let (env, client, accounts, proposal_id, _target) = setup!();
+        client.vote(&proposal_id, &accounts.user2, &false);
+        env.ledger().set_timestamp(START + DURATION + 1);
+
+        let view = client.readiness(&proposal_id);
+        assert!(view.expired);
+        assert!(!view.majority_reached);
+        assert!(!view.executable);
+        assert!(view.rejected);
+        assert!(!view.terminal, "still Active until execute finalises it");
+    }
+
+    /// Executed proposals are terminal.
+    #[test]
+    fn readiness_of_an_executed_proposal_is_terminal() {
+        let (env, client, accounts, proposal_id, _target) = setup!();
+        client.vote(&proposal_id, &accounts.user2, &true);
+        env.ledger().set_timestamp(START + DURATION + 1);
+        // First call finalises Active -> Succeeded, the second performs the call
+        // and moves it to Executed (the split the contract's own tests rely on).
+        client.execute(&proposal_id);
+        assert_eq!(client.readiness(&proposal_id).state, ProposalState::Succeeded);
+        client.execute(&proposal_id);
+
+        let view = client.readiness(&proposal_id);
+        assert_eq!(view.state, ProposalState::Executed);
+        assert!(view.terminal);
+        assert!(!view.executable);
+        assert!(!view.voting_open);
+        assert!(!view.expired);
+    }
+
+    /// Unknown ids surface as NotFound, not a zeroed view.
+    #[test]
+    fn readiness_of_an_unknown_proposal_is_not_found() {
+        let (_env, client, _accounts, _proposal_id, _target) = setup!();
+        let err = client.try_readiness(&9999_u64).unwrap_err();
+        assert_eq!(err, Ok(ForgeError::NotFound));
     }
 
     #[test]
